@@ -1,0 +1,1190 @@
+---
+title: "Energy Markets: Does Employee Satisfaction Help Explain Excess Returns?"
+author: "Enzo Capenakas, Nolan Philippon, Will Thompson"
+date: 12/04/2025
+format:
+  html:
+    toc: true
+    toc-location: right
+    toc-title: "Table of Contents"
+    fontsize: 0.9em
+    embed-resources: true
+editor: source
+echo: false
+---
+
+## Executive Summary
+
+-   We scraped employee reviews from a selection of the 12 biggest companies in the energy sector in Canada. We used sentiment analysis to measure employee sentiment from the reviews as well as the employee’s numeric ratings of the companies. We measured the impact of those sentiment scores on the companies’ excess returns using regression analysis, decision tree analysis, and PCA.
+-   Key Findings:
+    -   Both sentiment analysis scores and average rating were found to increase model fit only by a small amount.
+    -   Bayesian regression found Average Rating score to be significant but not Average Sentiment.
+    -   All three ML models explained similar portions of excess returns (~30%).
+-   Conclusion: Publicly available employee satisfaction data does not seem to be a good indicator of excess returns at the company level in the short-run. They might be useful additions to a larger model that tries to predict excess returns in the long-run.
+
+```{r warning = F, echo = F, message = F}
+library(tidyverse)
+library(tidytext)
+library(lexicon)
+library(sentimentr)
+library(magrittr)
+library(textdata)
+library(tidyquant)
+library(tidymodels)
+library(jsonlite)
+library(lubridate)
+library(rvest)
+library(chromote)
+library(rstanarm)
+library(broom.mixed)
+library(parsnip)
+library(rpart.plot)
+library(gt)
+library(ggfortify)
+library(wordcloud2)
+library(ggrepel)
+library(kableExtra)
+library(tidyr)
+library(slider)
+library(ranger)
+
+knitr::opts_chunk$set(warning = F, message = F, echo = F)
+options(scipen = 999)
+```
+
+<!-- Glassdoor scraping -->
+
+## Scraping Glassdoor
+
+In order to obtain the employee sentiment data required for this analysis, we scraped the Glassdoor.ca, the most widely used employer review site in Canada.
+
+-   Scraping is done using a search-first, content-matching javascript bot, allowing it to handle the dynamic html of the site. The javascript component of our scraper was created with the help of Gemini 3.0.
+-   Our initial data set included 2,477 reviews across 20 different companies, from as early as 2008. The maximum number of reviews included per company is 300.
+-   Employee-submitted reviews contain a 1-5 rating, a list of pros and cons, and a title.
+-   After cleaning the data to remove reviews prior to 2015, as well as companies with too few observations, we are left with 2,241 reviews across 12 firms.
+
+
+<!-- Scraping Script -->
+
+<!-- using javascript file nolan-enzo-will-glassdoor_scraper.js -->
+
+```{r, include = F}
+run_scraper = FALSE
+
+# Configuration
+node_path <- "node.exe"
+
+# TERMINAL COMMANDS FOR NODE.JS 
+# 1. Initialize a new Node project
+# npm init -y
+
+# 2. Install Playwright
+# npm install playwright
+
+# 3. Install Chromium
+# npx playwright install chromium
+
+script_path <- "nolan-enzo-will-glassdoor_scraper.js" 
+
+data_file <- "glassdoor_data.json" # Output file as defined in JS, make sure JS saves to working directory.
+
+# --- CHECKS ---
+if (!file.exists(script_path)) {
+  stop("Could not find nolan-enzo-will-glassdoor_scraper.js")
+}
+
+# --- EXECUTION ---
+if (run_scraper == TRUE) {
+  cmd <- paste(shQuote(node_path), shQuote(script_path))
+
+message("--- GLASSDOOR SCRAPER ---")
+message("1. Chrome will open. If this is your first time, you MUST log in.")
+message("2. If you see 'Session Timed Out', try 'Continue with Google' or refresh.")
+message("3. Once logged in, the script creates a 'glassdoor_auth' folder to save your session.")
+message("4. Future runs should log you in automatically!")
+
+system(cmd, wait = TRUE)
+}
+
+# --- LOAD DATA ---
+if(run_scraper == TRUE) {
+  if (file.exists(data_file)) {
+    reviews <- fromJSON(data_file)
+  
+    print(paste("Loaded", nrow(reviews), "reviews."))
+    print(head(reviews))
+  } 
+  else {
+    warning("No data file found.")
+  }
+} else {
+  print("Scraper not run, Loading reviews from backup.")
+}
+```
+
+<!-- Opening as RDS -->
+
+```{r}
+if (run_scraper == TRUE) {
+  glassdoor_reviews <- reviews
+} else {
+  glassdoor_reviews <- readRDS("glassdoor_reviews_backup.rds")
+}
+
+# head(glassdoor_reviews, 10)
+```
+
+<!-- Data Cleaning -->
+
+```{r}
+gd_reviews_clean <- glassdoor_reviews %>% 
+  dplyr::select(-c(job_title, advice)) %>% 
+  dplyr::mutate(
+    # Fix data types
+    rating = as.numeric(rating),
+    date = mdy(date),
+    
+    # Make date columns
+    year = year(date),
+    month = month(date, label = TRUE),
+    
+    # Make review IDs
+    review_id = row_number()
+  )
+```
+
+```{r}
+gd_reviews_final <- gd_reviews_clean %>% 
+  dplyr::filter(! company %in% c("Peyto Exploration & Development", "NuVista Energy", "Tourmaline Oil", "Whitecap Resources", "Strathcona Resources", "Athabasca Oil", "Baytex Energy", "MEG Energy")) %>% 
+  dplyr::filter(date > as.Date("2015-01-01"))
+```
+
+### Example Review
+
+```{r}
+head(gd_reviews_final, 1) %>% 
+  select(-c(review_id, year, month)) %>% 
+  gt::gt() %>% 
+  fmt_date(
+    columns = date,
+    date_style = "month_day_year"
+  ) %>% 
+  cols_label(
+    company = "Company",
+    rating = "Rating",
+    date = "Date",
+    title = "Title",
+    pros = "Pros",
+    cons = "Cons"
+  ) %>% 
+  cols_align(
+    align = "center",
+    columns = c(rating,date)
+  )
+  
+```
+
+### Reviews per Company
+
+```{r, fig.height = 3, fig.width = 10}
+num_ratings <- gd_reviews_final %>% 
+  dplyr::group_by(company) %>% 
+  summarise(
+    rating_count = n(),
+    .groups = "drop"
+  )
+
+ggplot(num_ratings, aes(x = reorder(company, rating_count), y = rating_count)) +
+  geom_bar(stat = "identity", fill = "gray20") +
+  coord_flip() +
+  geom_text(aes(label = rating_count),
+            hjust = 1.2,
+            color = "white",
+            fontface = "bold",
+            size = 3.5) +
+  labs(x = NULL, 
+       y = "Number of Glassdoor Reviews (Max 300)"
+  ) +
+  theme_light() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    axis.text.x = element_text(size = 0),
+    axis.title.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10, color = "black")
+  )
+
+```
+
+## Defining Employee Satisfaction
+
+We measured employee satisfaction in two ways:
+
+1.  The quantitative 1-5 ratings left by employees.
+2.  A "sentiment rating", which we calculated by running each reviews title, pros, and cons through the SentimentR Natural Language Processing model.
+    -   We chose SentimentR as our NLP model due to its ability to evaluate valence shifters. We felt this was the best option for analyzing employee reviews due to its ability to evaluate phrases such as “very bad management” or “salary not competitive”.
+
+Both measures are calculated on a per-review basis, then averaged out by month for each company.
+
+### Employee Ratings
+
+```{r}
+monthly_rating <- gd_reviews_final %>% 
+  dplyr::group_by(company, year, month) %>% 
+  summarise(
+    avg_rating = mean(rating),
+    review_count = n(),
+    .groups = "drop"
+  ) %>% 
+  dplyr::mutate(
+    date = ymd(paste(year, month, "01", sep = "-"))
+  ) %>% 
+  dplyr::select(company, date, avg_rating, review_count) %>% 
+  arrange(company,date)
+
+#head(monthly_rating,10)  
+```
+
+```{r, fig.heigh = 4, fig.width = 10}
+ggplot(monthly_rating, aes(x = date, y = avg_rating, color = company)) +
+  geom_point(aes(size = review_count), alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE, size = 1.2, span = 0.5) +
+  scale_y_continuous(limits = c(1,5), breaks = 1:5) +
+  labs(title = "Monthly Rating Trend by Company",
+       subtitle = "Dot sizes represent monthly review volume. Smoothed trend lines.",
+       y = "Average Rating (1-5)",
+       x = NULL,
+       color = "Company",
+       size = "# of Reviews/Mo") +
+  guides(size = "none") +
+  theme_light() +
+  theme(
+    panel.grid.minor.y = element_blank(),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 12, color = "black"),
+    axis.title.y = element_text(size = 12, face = "bold")
+  )
+  
+```
+
+The chart above shows the monthly average 1-5 rating given to companies by employees across time as well as the number of reviews. From this graph we can see that the number of reviews has drastically risen in the last few years. At the same time we can see that as the number of reviews increases the average rating stays between 3 and 4 for most companies. This is consistent with what we would expect from a normal distribution.
+
+<!-- Sentiment Indicators (SentimentR) -->
+
+```{r}
+#precomputing sentences in order to cut processing time as per warning
+pros_sentences <- get_sentences(gd_reviews_final$pros)
+cons_sentences <- get_sentences(gd_reviews_final$cons)
+
+
+#running sentiment analysis 
+sent_title <- sentiment_by(get_sentences(gd_reviews_final$title))
+sent_pros <- sentiment_by(pros_sentences)
+sent_cons <- sentiment_by(cons_sentences)
+
+
+#mean(sent_cons$ave_sentiment) #cons avg sentiment = 0.002604974
+#mean(sent_pros$ave_sentiment) #pros avg sentiment = 0.6426281
+
+
+#creating a data frame to compute the sentiment score for each review based off the length of each part
+sent_df <- data.frame(
+  sent_title = sent_title$ave_sentiment,
+  sent_pros = sent_pros$ave_sentiment,
+  sent_cons = sent_cons$ave_sentiment,
+  title = gd_reviews_final$title,
+  pros = gd_reviews_final$pros,
+  cons = gd_reviews_final$cons
+)
+
+
+#computing text lengths and replacing n/a values with 0 so the weights work 
+sent_df$len_title <- nchar(sent_df$title)
+sent_df$len_pros <- nchar(sent_df$pros)
+sent_df$len_cons <- nchar(sent_df$cons)
+
+sent_df$len_title[is.na(sent_df$len_title)] <- 0
+sent_df$len_pros[is.na(sent_df$len_pros)] <- 0
+sent_df$len_cons[is.na(sent_df$len_cons)] <- 0
+
+
+#computing the weighted sentiment score 
+sent_df$total_len <- sent_df$len_title + sent_df$len_pros + sent_df$len_cons
+
+sent_df$sent_overall <- (
+  sent_df$sent_title * sent_df$len_title +
+  sent_df$sent_pros * sent_df$len_pros +
+  sent_df$sent_cons * sent_df$len_cons
+) / sent_df$total_len
+
+#sent_df$sent_overall <- sent_df$sent_pros - abs(sent_df$sent_cons)
+
+sent_df$sent_overall[is.nan(sent_df$sent_overall)] <- NA
+
+
+
+#adding the overall sentiment score to the main df 
+gd_reviews_final$sent_overall_will <- sent_df$sent_overall
+
+```
+
+<!-- bigram tokenization -->
+
+```{r}
+pros_bigram <- gd_reviews_final %>%
+  dplyr::select(company, pros) %>%
+  tidytext::unnest_tokens(output = word, input = pros, token = "ngrams", n = 2) %>%
+  tidyr::separate(word, c("w1", "w2"), sep = " ") %>%
+  dplyr::filter(!w1 %in% stop_words$word,
+                !w2 %in% stop_words$word) %>%
+  na.omit() %>%
+  tidyr::unite(word, w1, w2, sep = " ") %>%
+  dplyr::filter(!grepl("\\d", word)) %>%
+  dplyr::count(company, word, sort = T)
+
+cons_bigram <- gd_reviews_final %>%
+  dplyr::select(company, cons) %>%
+  tidytext::unnest_tokens(output = word, input = cons, token = "ngrams", n = 2) %>%
+  tidyr::separate(word, c("w1", "w2"), sep = " ") %>%
+  dplyr::filter(!w1 %in% stop_words$word,
+                !w2 %in% stop_words$word) %>%
+  na.omit() %>%
+  tidyr::unite(word, w1, w2, sep = " ") %>%
+  dplyr::filter(!grepl("\\d", word)) %>%
+  dplyr::count(company, word, sort = T)
+
+title_bigram <- gd_reviews_final %>%
+  dplyr::select(company, title) %>%
+  tidytext::unnest_tokens(output = word, input = title, token = "ngrams", n = 2) %>%
+  tidyr::separate(word, c("w1", "w2"), sep = " ") %>%
+  dplyr::filter(!w1 %in% stop_words$word,
+                !w2 %in% stop_words$word) %>%
+  na.omit() %>%
+  tidyr::unite(word, w1, w2, sep = " ") %>%
+  dplyr::filter(!grepl("\\d", word)) %>%
+  dplyr::count(company, word, sort = T)
+
+nplNgrams <- bind_rows(pros_bigram, cons_bigram, title_bigram)
+  
+```
+
+### Employee Sentiment Ratings
+
+From the wordmap we can get an idea of what matters most for employees when giving a company rating. What jumps out is that the most important issues for employees are company culture, work-life balance, and career growth, which we would expect.
+
+```{r}
+p1 <- nplNgrams %>% 
+   group_by(word) %>%
+  summarise(freq = n(), .groups = "drop") %>%
+  slice_max(freq, n = 1000)%>%
+  wordcloud2(data = ., size = 0.15)
+
+p1
+```
+
+<!-- Final data -->
+
+```{r}
+gd_reviews_final <- gd_reviews_final %>% 
+  dplyr::select(c(review_id, company, date, year, month, rating, sent_overall_will, title, pros, cons,))
+
+#gd_reviews_final
+```
+
+<!-- Stock Prices -->
+
+<!-- Stock Tickers -->
+
+```{r}
+tickers <- tibble(
+  company = c(
+    "Enbridge",
+    "Canadian Natural Resources",
+    "Suncor Energy",
+    "TC Energy",
+    "Cenovus Energy",
+    "Imperial Oil",
+    "Pembina Pipeline",
+    "ARC Resources",
+    "Keyera",
+    "Gibson Energy",
+    "Vermilion Energy"
+  ),
+  ticker = c(
+    "ENB.TO",
+    "CNQ.TO",
+    "SU.TO",
+    "TRP.TO",
+    "CVE.TO",
+    "IMO.TO",
+    "PPL.TO",
+    "ARX.TO",
+    "KEY.TO",
+    "GEI.TO",
+    "VET.TO"
+  )
+)
+```
+
+<!-- Get Stock Data -->
+
+```{r}
+stocks <- tidyquant::tq_get(tickers$ticker, get = "stock_prices", from = "2014-11-01") %>%
+  dplyr::mutate(ret = log(adjusted / dplyr::lag(adjusted))) %>%
+  na.omit()
+
+monthly_rets <- stocks %>%
+  dplyr::mutate(date = format(as.Date(date), "%Y-%m")) %>%
+  dplyr::group_by(symbol, date) %>%
+  dplyr::summarise(
+    monthly_ret = sum(ret),
+    .groups = "drop"
+  )
+
+wti <- tq_get("CL=F", from = "2015-01-01") %>%
+  tidyquant::tq_transmute(
+    select = adjusted,
+    mutate_fun = periodReturn,
+    period = "monthly",
+    type = "log",
+    col_rename = "wti_ret"
+  ) %>%
+  dplyr::mutate(date = format(as.Date(date), "%Y-%m")) %>%
+  na.omit()
+
+ng <- tq_get("NG=F", from="2015-01-01") %>%
+  tq_transmute(
+    select = adjusted,
+    mutate_fun = periodReturn,
+    period = "monthly",
+    type = "log",
+    col_rename = "ng_ret"
+  ) %>%
+  mutate(date = format(as.Date(date), "%Y-%m")) %>%
+  na.omit()
+
+xeg <- tq_get("XEG.TO", from = "2014-11-01") %>%
+  tq_transmute(
+    select = adjusted,
+    mutate_fun = periodReturn,
+    period = "monthly",
+    type = "log",
+    col_rename = "xeg_ret"
+  ) %>%
+  mutate(date = format(as.Date(date), "%Y-%m")) %>%
+  na.omit()
+
+rf <- tq_get("GS1M", get = "economic.data", from = "2015-01-01") %>%
+  mutate(
+    date = format(as.Date(date), "%Y-%m"),
+    rf = price / 100
+  ) %>%
+  select(-price, -symbol)
+```
+
+```{r}
+monthly_sentiment <- gd_reviews_final %>%
+  dplyr::mutate(date = format(as.Date(date), "%Y-%m")) %>%
+  dplyr::group_by(company, date) %>%
+  dplyr::summarise(
+    avg_sentiment = mean(sent_overall_will, na.rm = TRUE),
+    mean_rating = mean(rating, na.rm = TRUE),
+    n_reviews = n(),
+    .groups = "drop"
+  )
+
+monthly_sentiment <- monthly_sentiment %>%
+  dplyr::left_join(tickers, by = "company") %>%
+  dplyr::rename(symbol = ticker)
+
+ml_data <- monthly_rets %>%
+  left_join(monthly_sentiment, by = c("symbol", "date")) %>%
+  left_join(wti, by = "date") %>%
+  left_join(xeg, by = "date") %>%
+  left_join(ng, by = "date") %>%
+  left_join(rf, by = "date") %>%
+  dplyr::select(-company) %>%
+  dplyr::rename(ticker = symbol) %>%
+  dplyr::left_join(tickers, by = "ticker") %>%
+  fill(wti_ret, ng_ret, xeg_ret, rf, .direction = "down") %>%
+  dplyr::mutate(
+    avg_sentiment = replace_na(avg_sentiment, 0),
+    mean_rating = replace_na(mean_rating, 0),
+    n_reviews = replace_na(n_reviews, 0),
+    excess_ret = monthly_ret - xeg_ret,
+    mom_3m = excess_ret + lag(excess_ret,1) + lag(excess_ret,2),
+    vol_3m = sqrt((monthly_ret^2 + lag(monthly_ret,1)^2 + lag(monthly_ret,2)^2)/3),
+    mkt_rp = xeg_ret - rf
+  ) %>%
+  dplyr::select(-monthly_ret, -xeg_ret) %>%
+  dplyr::filter(date >= "2015-01")
+```
+
+```{r}
+df_split <- ml_data %>% 
+  rsample::initial_time_split(prop = 0.70)
+
+df_train <- rsample::training(df_split)
+df_test  <- rsample::testing(df_split)
+
+recipe_pipeline <- recipes::recipe(excess_ret ~ ., data = df_train) %>%
+  recipes::step_rm(date) %>%
+  recipes::step_rm(ticker) %>%
+  recipes::step_rm(rf) %>%
+  recipes::step_rm(company) %>%
+  recipes::step_normalize(all_numeric()) %>%
+  recipes::step_dummy(all_nominal()) %>%
+  recipes::prep()
+train_baked <- recipes::bake(recipe_pipeline, df_train)
+
+test_baked <- recipes::bake(recipe_pipeline, df_test)
+```
+
+## Modeling
+
+### Target: Excess Returns
+
+The variable we are trying to predict is excess returns using 1-month return data from our company selection data. That is calculated using the 1-month return data from the TSX Energy Index (XEG.TO). We defined excess returns as 1-month company returns - 1-month TSX Energy Returns.
+
+Our explanatory variables are Average Sentiment, Average Rating, Number of Reviews, 3-Month Running Average (as a measure if Momentum), Volatility, and Market Risk Premium.
+
+### Linear Regression
+
+```{r}
+# Modeling (Linear Regression)
+model_lm <- 
+  parsnip::linear_reg(mode = "regression") %>%
+  parsnip::set_engine("lm") %>% 
+  parsnip::fit(excess_ret ~ . ,  data = train_baked)
+
+out <- model_lm %>% 
+  stats::predict(new_data = test_baked) %>% 
+  dplyr::bind_cols(excess_ret = test_baked %>% ungroup() %>% dplyr::select(excess_ret))
+
+# Results
+parsnip::tidy(model_lm) %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  gt::gt()
+```
+
+Our Linear Regression model indicates that momentum (mom_3m) is the biggest indicator of excess returns, followed by volatility (vol_3m) and market risk premium (mkt_rp). Comparatively sentiment score and average rating add very little predictive power to the model.
+
+Momentum, volatility, and market risk premium are the only significant variables in this model, with p values \< 0.001. Our regression indicates that for average sentiment, average rating, number of reviews, WTI returns, and Natural Gas Returns the p values are too high to be significant. This suggests that sentimentality measure have no predictive power in determining excess returns.
+
+```{r}
+parsnip::glance(model_lm) %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  gt::gt()
+```
+
+Our training data set results indicate that we predict our model has low predictive power. The R Squared indicates that our current model explains 26.1% of the variance in excess returns from companies in the Energy sector.
+
+```{r}
+model_lm %>% 
+  stats::predict(new_data = test_baked) %>%
+  dplyr::bind_cols(excess_ret = test_baked %>% ungroup() %>% dplyr::select(excess_ret)) %>% 
+  yardstick::metrics(truth = excess_ret, estimate = .pred) %>% dplyr::arrange(.metric) %>%
+  gt::gt()
+```
+
+The results of our testing data measure how well our model is performing in the out of sample period. This indicates that our actual model performed better than our predicted model with an R Squared value of 30.0%. This means that our model explains 30.0% of the variance in excess returns for companies in the Energy sector.
+
+This model suggests that momentum, variance, and market risk premium have high explanatory power when it comes to excess returns, while sentimentality scores and commodity prices do not. Commodity prices likely do not increase model predictability because they are already priced into the TSX Energy Index (XEG.TO) and get captured by the market risk premium variable. Sentimentality scores on the other hand have no effect in the short run (1-month excess returns) but likely could be used to predict returns in the long run given a larger data set.
+
+```{r}
+autoplot(model_lm, size = 0.5)
+```
+
+Residual vs Fitted plot indicates that the model exhibits some fit.
+
+Q-Q plot indicates that the model fits a normal distribution somewhat well with some diversion in the tails.
+
+Location-Scale plot indicates some heteroscedasticity.
+
+Residuals vs Leverage plot indicates that outliers have higher influence on the regression.
+
+### Bayesian Regression
+
+```{r}
+# Modeling (bayesian regression)
+options(mc.cores = parallel::detectCores() - 1)
+model_bayes <- parsnip::linear_reg(mode = "regression") %>%
+  parsnip::set_engine("stan",
+                      prior_intercept = rstanarm::normal(),
+                      prior = rstanarm::student_t(df = 1),
+                      iter = 4000,
+                      seed = 235
+                      ) %>%
+  parsnip::fit(excess_ret ~ ., data = train_baked)
+
+broom.mixed::tidy(
+  model_bayes,
+  conf.int = TRUE,
+  conf.level = 0.2) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~round(.x,5))) %>%
+  gt::gt()
+```
+
+Our Bayesian Regression indicates that all variables except Average Sentiment are significant to some degree. We used an 80%¨confidence interval for this model. Since the other variable do not cross the null value (0), they are considered significant.
+
+```{r, fig.height = 6, fig.width = 8}
+broom.mixed::tidy(model_bayes, conf.int = T) %>%
+  ggplot2::ggplot(aes(x = term)) +
+  geom_point(aes(y = estimate)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 1.5)
+```
+
+The Average Rating confidence interval indicates that the higher employee satisfaction, the lower the excess returns. This could indicate that when employees in more stable firms are more satisfied, and more stable (older) firms generally bring lower excess returns.
+
+The Number of Reviews confidence interval indicates that the more reviews there are, the lower the excess returns. This is likely because firms with more reviews tend to be larger and more established, and are less likely to experience large monthly share price changes.
+
+The confidence intervals for WTI returns and Natural Gas returns indicate that when those commodities do well, firms with higher exposure to them have higher excess returns.
+
+The confidence intervals for Momentum and Volatility indicate that firms generally maintain past momentum regarding excess returns and that firms with higher volatility generally have higher excess returns.
+
+The market risk premium confidence interval indicates that when market risk premium rises, we expect lower excess returns from energy firms, likely because the rise in the market risk premium would be driven by a few large firms.
+
+```{r}
+model_bayes %>% 
+  stats::predict(new_data = test_baked) %>%
+  dplyr::bind_cols(excess_ret = test_baked %>% ungroup() %>% dplyr::select(excess_ret)) %>% 
+  yardstick::metrics(truth = excess_ret, estimate = .pred) %>% dplyr::arrange(.metric) %>%
+  gt::gt()
+
+```
+
+An R Squared value of 29.0% indicates that our Bayesian model predicts a similar portion of excess returns as our Linear model.
+
+### Decision Tree
+
+```{r}
+model_cart <- parsnip::decision_tree(mode = "regression") %>%
+  parsnip::set_engine("rpart") %>%
+  parsnip::fit(excess_ret ~ .,  data = train_baked)
+```
+
+```{r}
+rpart.plot(
+  model_cart$fit,
+  roundint = F,
+  cex = 1,
+  fallen.leaves = F,
+  extra = "auto",
+  main = "Regression Tree"
+)
+```
+
+A Decision Tree can be used to visualize our variable from the most to the least explanatory. As we can see from above Momentum is the most explanatory variable with Average Sentiment and Market Risk Premium following it. And the Volatility and WTI returns.
+
+```{r}
+res <- model_cart %>% predict(new_data = test_baked) %>%
+  bind_cols(test_baked %>% dplyr::select(excess_ret))
+res %>% yardstick::metrics(truth = excess_ret, estimate = .pred) %>%
+  gt::gt()
+```
+
+This model explains a similar portion of excess returns as the previous ones with an R Squared value of 26.3%.
+
+```{r, fig.height = 4, fig.width = 8}
+res %>% ggplot(aes(x = .pred, y = excess_ret)) + 
+  geom_point() +
+  labs(title = "Predicted vs Actual Excess Returns",
+       subtitle = "Decision Tree - Regression", x = "Actual Excess Returns", y = "Predicted Excess Returns") +
+  theme_light()
+```
+
+
+## Prediction Results 
+
+
+In this section, we evaluate how well our TidyML models predict the direction of Enbridge’s monthly excess returns using employee sentiment and rating data. Using the tidymodels framework, we trained and compared two classification models, logistic regression and random forest, and assessed their performance through confusion matrices, ROC curves, and summary metrics such as accuracy and AUC. These results allow us to determine whether sentiment-based features contain meaningful predictive information for excess returns.
+
+
+Our goal in this section is to determine whether the models can correctly classify each month as having an “up” or “down” excess return based solely on sentiment and rating inputs.
+
+
+
+
+```{r}
+
+#Downloading tsx energy index to eliminate the major correlation of Enbridge with the market, see if the sentiment of employees can predict or is predicted by the variation in stock price from index
+
+xeg <- tq_get("XEG.TO", from = "2015-01-01") %>%
+  tq_transmute(
+    select     = adjusted,
+    mutate_fun = periodReturn,
+    period     = "monthly",
+    type       = "log",
+    col_rename = "xeg_ret"
+  ) %>%
+  mutate(month = floor_date(date, "month")) %>%
+  select(month, xeg_ret) %>%
+  na.omit()
+
+
+```
+
+
+```{r}
+
+enb_px <- tq_get("ENB.TO", from = "2015-01-01") %>% 
+  select(date, adjusted)  
+
+enb_monthly_ret <- enb_px %>%
+  tq_transmute(
+    select     = adjusted,
+    mutate_fun = periodReturn,
+    period     = "monthly",
+    type       = "log",
+    col_rename = "monthly_ret"
+  ) %>%
+  mutate(month = floor_date(date, "month")) %>%   # align to first day of month
+  select(month, monthly_ret)
+
+enb_monthly_price <- enb_px %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    price = last(adjusted)   
+  ) %>%
+  ungroup()
+
+enb <- gd_reviews_final %>%
+  filter(company == "Enbridge") %>%
+  filter(!is.na(sent_overall_will), !is.na(rating)) %>%
+  mutate(
+    date = as.Date(date, format = "%b %d, %Y"),
+    rating_scaled = (as.numeric(rating) - 3) / 2
+  )
+
+enb <- enb %>%
+  mutate(
+    rating = as.numeric(rating), 
+    firm   = "ENB"
+  )
+
+enb_monthly_sent <- enb %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    sent      = mean(sent_overall_will, na.rm = TRUE),
+    rating    = mean(as.numeric(rating),       na.rm = TRUE),
+    n_reviews = n()
+  ) %>%
+  ungroup()
+
+enb_monthly_sp <- enb_monthly_sent %>%
+  left_join(enb_monthly_price, by = "month") %>%
+  left_join(enb_monthly_ret,   by = "month") %>%
+  filter(!is.na(price), !is.na(monthly_ret))
+
+
+range_sent  <- max(enb_monthly_sp$sent,  na.rm = TRUE) - min(enb_monthly_sp$sent,  na.rm = TRUE)
+
+range_price <- max(enb_monthly_sp$price, na.rm = TRUE) - min(enb_monthly_sp$price, na.rm = TRUE)
+scale_factor_price <- range_sent / range_price
+
+range_ret <- max(enb_monthly_sp$monthly_ret, na.rm = TRUE) - min(enb_monthly_sp$monthly_ret, na.rm = TRUE)
+scale_factor_ret <- range_sent / range_ret
+
+
+
+enb_monthly_sp <- enb_monthly_sp %>%
+  mutate(price_scaled = price * scale_factor_price)
+
+
+
+enb_monthly_sp_sm <- enb_monthly_sp %>%
+  mutate(
+    sent_3m  = slide_dbl(sent,  mean, .before = 2, .complete = TRUE),
+    rating_3m = slide_dbl(rating, mean, .before = 2, .complete = TRUE),
+    rating_3m_norm = (rating_3m - 1) / 4,
+    price_3m = slide_dbl(price, mean, .before = 2, .complete = TRUE),
+    price_3m_scaled = price_3m * scale_factor_price,
+    ret_3m        = slide_dbl(monthly_ret, mean, .before = 2, .complete = TRUE),
+    ret_3m_scaled = ret_3m * scale_factor_ret) %>%
+  filter(!is.na(sent_3m)) 
+
+
+```
+
+
+
+
+
+```{r}
+
+#Prepping the data for ML
+
+
+
+sent_monthly <- enb %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(firm, month) %>%
+  summarise(
+    sent_mean   = mean(sent_overall_will, na.rm = TRUE),
+    rating_mean = mean(rating,       na.rm = TRUE),
+    n_reviews   = n(),
+    .groups = "drop"
+  )
+
+
+#Grabbing Enb Prices 
+enb_px <- tq_get("ENB.TO", from = "2015-01-01") %>% 
+  select(date, adjusted)  
+
+#Computing monthly returns 
+price_monthly <- enb_px %>%
+  transmute(
+    firm  = "ENB",
+    month = floor_date(date, "month"),
+    adjusted
+  ) %>%
+  group_by(firm, month) %>%
+  summarise(price = last(adjusted), .groups = "drop") %>%
+  arrange(firm, month) %>%
+  group_by(firm) %>%
+  mutate(
+    ret_1m = log(price / lag(price)),       
+    ret_3m = log(price / lag(price, 3)),     
+    ret_6m = log(price / lag(price, 6))      
+  ) %>%
+  ungroup()
+
+
+monthly_joined <- sent_monthly %>%
+  inner_join(price_monthly, by = c("firm", "month"))
+
+
+df_ml <- monthly_joined %>%
+  arrange(firm, month) %>%
+  group_by(firm) %>%
+  mutate(
+    
+    sent_3m   = slide_dbl(sent_mean,   mean, .before = 2, .complete = TRUE),
+    rating_3m = slide_dbl(rating_mean, mean, .before = 2, .complete = TRUE),
+    nrev_3m   = slide_dbl(n_reviews,   sum,  .before = 2, .complete = TRUE),
+
+    
+    past_ret_3m = slide_dbl(ret_1m, mean, .before = 2, .complete = TRUE),
+
+    
+    target_ret_1m = lead(ret_1m, 1),
+    target_up_1m  = factor(if_else(target_ret_1m > 0, "up", "down"),
+                           levels = c("down", "up"))
+  ) %>%
+  ungroup() 
+
+
+
+df_ml <- df_ml %>%
+  select(
+    firm, month,
+    target_ret_1m, target_up_1m,      
+    sent_3m, rating_3m, nrev_3m,      
+    past_ret_3m,                      
+    ret_1m, ret_3m, ret_6m            
+  )
+
+
+df_ml <- df_ml %>%
+  mutate(target_up_1m = factor(target_up_1m, levels = c("down","up")))
+
+
+#Adding the xeg returns so we can check with excess returns 
+df_ml <- df_ml %>%
+  left_join(xeg, by = "month")
+
+#Computing excess returns 
+df_ml <- df_ml %>%
+  mutate(
+    excess_1m = ret_1m - xeg_ret,
+    excess_3m = ret_3m - rollapply(xeg_ret, 3, sum, align = "right", fill = NA),
+    excess_6m = ret_6m - rollapply(xeg_ret, 6, sum, align = "right", fill = NA)
+  ) %>%
+  drop_na()
+
+```
+
+
+
+```{r}
+
+#All previous ML/PCA stuff is with total returns and used past returns as a predictor
+#Looking at predicting excess returns for Enbridge using sentiment 
+
+#New clean dataset 
+
+
+df_ml2 <- enb_monthly_sp_sm %>%
+  select(month, sent_3m, rating_3m, monthly_ret) %>%      
+  left_join(
+    xeg %>%
+      transmute(month, xeg_ret_1m = xeg_ret),            
+    by = "month"
+  ) %>%
+  mutate(
+    excess_ret_1m = monthly_ret - xeg_ret_1m,             
+    target_excess_up_1m = factor(
+      ifelse(excess_ret_1m > 0, "up", "down"),
+      levels = c("down", "up")
+    )
+  ) %>%
+  select(month, target_excess_up_1m, sent_3m, rating_3m) %>%
+  na.omit()
+
+
+#Training 
+set.seed(123)
+
+spl <- initial_time_split(df_ml2, prop = 0.8)
+
+train <- training(spl)
+test  <- testing(spl)
+
+
+#With PCA 
+rec_excess_pca <- recipe(target_excess_up_1m ~ sent_3m + rating_3m,
+                         data = train) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), threshold = 0.9)
+
+
+#MODELS
+
+#Logistic regression 
+mod_log <- logistic_reg(mode = "classification") %>%
+  set_engine("glm")
+
+#Random forest 
+mod_rf <- rand_forest(
+    mode  = "classification",
+    trees = 1000,
+    mtry  = 2,
+    min_n = 5
+  ) %>%
+  set_engine("ranger", importance = "impurity")
+
+
+#With PCA 
+wf_log_excess_pca <- workflow() %>%
+  add_model(mod_log) %>%
+  add_recipe(rec_excess_pca)
+
+wf_rf_excess_pca <- workflow() %>%
+  add_model(mod_rf) %>%
+  add_recipe(rec_excess_pca)
+
+fit_log_excess_pca <- fit(wf_log_excess_pca, data = train)
+fit_rf_excess_pca  <- fit(wf_rf_excess_pca,  data = train)
+
+
+```
+
+
+
+```{r,out.width="95%",fig.align="center",fig.height = 4, fig.width=8}
+
+#Evaluating the model 
+
+# Predict on test set with probabilities and classes
+pred_log <- predict(fit_log_excess_pca, test, type = "prob") %>%
+  bind_cols(predict(fit_log_excess_pca, test)) %>%
+  bind_cols(test %>% select(target_excess_up_1m))
+
+pred_rf  <- predict(fit_rf_excess_pca, test, type = "prob") %>%
+  bind_cols(predict(fit_rf_excess_pca, test)) %>%
+  bind_cols(test %>% select(target_excess_up_1m))
+
+# Accuracy
+acc_log <- accuracy(pred_log,
+                    truth   = target_excess_up_1m,
+                    estimate = .pred_class)
+
+acc_rf  <- accuracy(pred_rf,
+                    truth   = target_excess_up_1m,
+                    estimate = .pred_class)
+
+
+# Confusion matrices
+cm_log <- conf_mat(pred_log,
+                   truth   = target_excess_up_1m,
+                   estimate = .pred_class)
+
+cm_rf  <- conf_mat(pred_rf,
+                   truth   = target_excess_up_1m,
+                   estimate = .pred_class)
+
+
+
+autoplot(cm_log, type = "heatmap") +
+  ggtitle("Logistic regression confusion matrix (excess returns)")
+
+autoplot(cm_rf, type = "heatmap") +
+  ggtitle("Random forest confusion matrix (excess returns)")
+
+```
+
+
+Looking at the confusion matrices, we can see that both models mostly predict “down” regardless of the true outcome. Logistic regression correctly identifies several down months but misses every up month, while the random forest performs similarly and only catches one up month out of three predicted. Overall accuracy sits at about 40 percent for both, showing that neither model is able to reliably classify the direction of excess returns from sentiment and ratings alone.
+
+
+
+```{r,out.width="95%",fig.align="center",fig.height=4,fig.width=10}
+# ROC and AUC
+roc_log <- roc_curve(pred_log,
+                     truth = target_excess_up_1m,
+                     .pred_up) %>%
+  mutate(model = "Logistic (PCA)")
+
+roc_rf  <- roc_curve(pred_rf,
+                     truth = target_excess_up_1m,
+                     .pred_up) %>%
+  mutate(model = "Random forest (PCA)")
+
+roc_bind <- bind_rows(roc_log, roc_rf)
+
+autoplot(roc_bind) +
+  ggtitle("ROC curves for models using sentiment & ratings on excess returns") +
+  theme_minimal()
+
+
+
+
+auc_log <- roc_auc(pred_log,
+                   truth = target_excess_up_1m,
+                   .pred_up)
+
+auc_rf  <- roc_auc(pred_rf,
+                   truth = target_excess_up_1m,
+                   .pred_up)
+
+
+
+#Printing out our accuracy and AUC results for both Logistic Regression and Random Forest
+acc_log_val <- acc_log %>% pull(.estimate) %>% round(3)
+acc_rf_val  <- acc_rf  %>% pull(.estimate) %>% round(3)
+
+auc_log_val <- auc_log %>% pull(.estimate) %>% round(3)
+auc_rf_val  <- auc_rf  %>% pull(.estimate) %>% round(3)
+
+```
+
+
+
+The ROC curves show that logistic regression has some ability to rank up vs. down months, with an AUC around 0.75, meaning it’s better than random guessing. The random forest curve sits close to the diagonal, with an AUC near 0.46, which means it isn’t picking up any real input.
+
+
+
+```{r,out.width="95%",dpi=150,fig.align="center",fig.height=8,fig.width=14}
+
+results <- tibble(
+  Model = c("Logistic regression", "Random forest"),
+  Accuracy = c(acc_log_val, acc_rf_val),
+  AUC = c(auc_log_val, auc_rf_val)
+)
+
+
+kable(results, digits = 3, align = "lcc",
+      col.names = c("Model", "Accuracy", "AUC"))
+
+
+```
+
+
+Both models only reach about 40 percent accuracy, so they struggle with actual up/down predictions. Logistic regression still shows decent ranking ability with a 0.75 AUC, while the random forest stays near random at 0.464. Overall, the predictors don’t give either model enough information to forecast excess returns well.
+
+
+
+## Principal Component Analysis 
+
+We applied PCA to explore whether employee sentiment and ratings capture multiple distinct dimensions of employee experience, or whether they reflect a single underlying latent factor.
+
+
+```{r,out.width="95%",fig.align="center",fig.height=4,fig.width=10}
+
+#PCA analysis (even though we only have two predictors)
+#PCA recipe 
+rec_pca_prep <- prep(rec_excess_pca)
+
+
+pca_var <- tidy(rec_pca_prep, number = 2, type = "variance")
+
+pca_scree <- pca_var %>%
+  filter(component == "comp")   # if you see both "cumulative" and "variance", keep "variance"
+
+
+#LOADINGS MAP 
+pca_loadings <- tidy(rec_pca_prep, number = 2)   
+
+
+pca <- prcomp(df_ml[, c("sent_3m", "rating_3m")], scale. = TRUE)
+eigenvalues <- pca$sdev^2
+
+
+prop_var <- eigenvalues / sum(eigenvalues)
+
+
+pca_df <- data.frame(
+  pc = factor(c("PC1", "PC2"), levels = c("PC1", "PC2")),
+  prop = prop_var
+)
+
+
+ggplot(pca_df, aes(x = pc, y = prop)) +
+  geom_col(fill = "grey70") +
+  geom_point(size = 3) +
+  geom_line(aes(group = 1)) +
+  labs(
+    title = "PCA Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+After scaling the variables and computing principal components, the scree plot shows that PC1 explains approximately 68 percent of total variance, while PC2 explains the remaining 32 percent. This indicates that although PC1 is clearly dominant, the two variables are not perfectly redundant and contain some residual differences.
+
+
+
+```{r,out.width="95%",fig.align="center",fig.height=4,fig.width=8}
+
+pca_pc12 <- pca_loadings %>%
+  filter(component %in% c("PC1", "PC2")) %>%
+  select(component, terms, value) %>%
+  tidyr::pivot_wider(names_from = component, values_from = value)
+
+
+ggplot(pca_pc12, aes(x = PC1, y = PC2, label = terms)) +
+  geom_hline(yintercept = 0, colour = "grey80") +
+  geom_vline(xintercept = 0, colour = "grey80") +
+  geom_point() +
+  geom_text_repel() +
+  labs(
+    title = "Loadings of sentiment and ratings on PC1 & PC2",
+    x = "PC1 loading",
+    y = "PC2 loading"
+  ) +
+  theme_minimal()
+
+```
+
+
+The loadings plot shows that sentiment and ratings load strongly and in the same direction onto PC1, confirming that both variables co-move and represent a shared underlying factor related to overall employee perception of the firm. PC2 captures only the small divergence between textual sentiment and numerical ratings, rather than a second meaningful economic dimension.
+
+
+These results imply that sentiment and ratings do not provide truly independent signals. PCA therefore does not meaningfully expand the information set available for forecasting. This aligns with our ML findings: once past returns are removed, employee sentiment and ratings alone do not contain sufficient unique variation to predict excess returns for Enbridge stock.
+
+## Conclusion
+
+Publicly available employee satisfaction data does not seem to be a good indicator of excess returns at the company level in the short-run. With more data points, they might be useful additions to a larger model that tries to predict excess returns in the long-run.
+
+
+
