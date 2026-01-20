@@ -15,7 +15,8 @@ To apply analytical methods to real-world data and communicate findings in a cle
 - Synthesis of findings into a cohesive report
 
 ## Tools & Technologies
-- Data analysis and reporting tools (e.g., R / Quarto)
+- Data analysis and reporting tools (R, Quarto)
+- JS script for web scraping
 - HTML for final report rendering
 
 ## Repository Contents
